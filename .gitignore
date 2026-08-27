@@ -1,0 +1,31 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PyInstaller
+dist/
+build/
+*.spec.bak
+
+# App cache (downloads / USB staging live under the user profile, but keep local copies out)
+.cache/
+downloads/
+usb_staging/
+.wlfrit-badupdate/
+
+# Logs / OS / editors
+*.log
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

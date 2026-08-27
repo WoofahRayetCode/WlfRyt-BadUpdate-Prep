@@ -1,0 +1,16 @@
+BG = "#0b0f0c"
+PANEL = "#121a14"
+CARD = "#18221b"
+ACCENT = "#107c10"
+ACCENT_HOVER = "#16a316"
+GLOW = "#5ad45a"
+TEXT = "#e8f0e8"
+MUTED = "#8aa08a"
+WARN = "#e3b341"
+OK = "#3ddc84"
+DANGER = "#e5534b"
+BORDER = "#2a3d2e"
+FONT = ("Segoe UI", 11)
+FONT_TITLE = ("Segoe UI", 22, "bold")
+FONT_H = ("Segoe UI", 13, "bold")
+FONT_SMALL = ("Segoe UI", 9)
