@@ -81,8 +81,14 @@ Write-Ok "PyInstaller ready"
 
 if (-not $SkipTests) {
     Write-Step "Running unit tests"
-    & $VenvPython -m unittest discover -s (Join-Path $ScriptDir "tests") -v
-    if ($LASTEXITCODE -ne 0) { throw "Unit tests failed. Build aborted." }
+    # Run from the repo root so `tests` and `badupdateprep` are importable packages (tests share fixtures).
+    Push-Location $ScriptDir
+    try {
+        & $VenvPython -m unittest discover -s tests -t . -v
+        if ($LASTEXITCODE -ne 0) { throw "Unit tests failed. Build aborted." }
+    } finally {
+        Pop-Location
+    }
     Write-Ok "All unit tests passed"
 }
 
