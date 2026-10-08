@@ -118,11 +118,18 @@ class Acquired:
 
 
 def _with_title(exc: BaseException, title: str) -> BaseException:
-    """Prefix a failure with the item it belongs to ("XeUnshackle: HTTP 503...") without changing its type."""
+    """Prefix a failure with the item it belongs to ("XeUnshackle: HTTP 503...").
+
+    Our own error types keep their identity (kind/status/retryable) and just get the prefix. Anything else (PermissionError,
+    UnicodeDecodeError, ...) is wrapped: OSError.__str__ ignores `args`, so editing args would silently do nothing.
+    """
     msg = str(exc)
-    if not msg.startswith(title) and exc.args:
+    if msg.startswith(f"{title}: "):
+        return exc
+    if isinstance(exc, (DownloadError, AssembleError)) and exc.args:
         exc.args = (f"{title}: {msg}",) + tuple(exc.args[1:])
-    return exc
+        return exc
+    return DownloadError(f"{title}: {msg}", kind="disk" if isinstance(exc, OSError) else "network")
 
 
 def _sha256_of(r: Resolved) -> str | None:
@@ -142,9 +149,14 @@ def resolve_artifact(art: Artifact, env: Env, emit: Emit | None = None) -> Resol
         hit = cache.latest_cached(art.key)
         if hit is None:
             raise
-        why = "GitHub rate limit" if isinstance(exc, RateLimited) else "no connection to the update server"
-        emit(Log(f"{art.title}: {why}; using cached {hit.tag} ({hit.asset})."))
-        r = Resolved(art, hit.tag, hit.asset, hit.url, hit.size, (("sha256", hit.sha256),), "pinned", offline=True)
+        if isinstance(exc, RateLimited):
+            why = "GitHub's rate limit was hit"
+        elif exc.kind == "layout":
+            why = "the newest release has a layout this app doesn't recognise"
+        else:
+            why = "couldn't reach GitHub"
+        emit(Log(f"{art.title}: {why}; using your cached {hit.tag} ({hit.asset}) instead."))
+        r = Resolved(art, hit.tag, hit.asset, hit.url, hit.size, (("sha256", hit.sha256),), "cached", offline=True)
     if env.rewrite_url:
         r = env.rewrite_url(r)
     return r
@@ -303,9 +315,11 @@ def run_prepare(
         except Cancelled:
             raise
         except Exception as exc:
-            _with_title(exc, a.title)
-            emit(ItemUpdate(a.key, "failed", note=str(exc)))
-            raise
+            err = _with_title(exc, a.title)
+            emit(ItemUpdate(a.key, "failed", note=str(err)))
+            if err is exc:
+                raise
+            raise err from exc
         r = resolved[a.key]
         emit(ItemUpdate(a.key, "queued", 0, r.size, version=r.tag, provenance=r.provenance))
     for a in arts:
@@ -343,9 +357,11 @@ def run_prepare(
             emit(ItemUpdate(a.key, "queued", note="cancelled"))
             raise
         except Exception as exc:
-            _with_title(exc, a.title)
-            emit(ItemUpdate(a.key, "failed", version=resolved[a.key].tag, note=str(exc)))
-            raise
+            err = _with_title(exc, a.title)
+            emit(ItemUpdate(a.key, "failed", version=resolved[a.key].tag, note=str(err)))
+            if err is exc:
+                raise
+            raise err from exc
 
     with contextlib.ExitStack() as stack:
         sources: dict[str, Source] = {}
@@ -413,7 +429,7 @@ def current_fingerprint(opts: Options, env: Env) -> str | None:
             hit = cache.latest_cached(a.key)
             if not hit:
                 return None
-            r = Resolved(a, hit.tag, hit.asset, hit.url, hit.size, (("sha256", hit.sha256),), "pinned", True)
+            r = Resolved(a, hit.tag, hit.asset, hit.url, hit.size, (("sha256", hit.sha256),), "cached", True)
         if env.rewrite_url:
             r = env.rewrite_url(r)
         if cache.lookup(r) != "hit":
@@ -450,6 +466,8 @@ class CopyReport:
     verified: int
     bad: list[tuple[str, str]]
     written: dict[str, str]
+    unchanged: int = 0  # files that were already on the stick, identical (hash-checked, not rewritten)
+    left_alone: int = 0  # old files not removed because they changed since this app wrote them
 
     @property
     def ok(self) -> bool:
@@ -472,7 +490,7 @@ def run_copy(
 ) -> CopyReport:
     plan = plan_copy(st, usb)
     if drive is not None:
-        findings = assess(drive, plan.bytes_needed, plan.bytes_replaced, protected=[env.app_dir, Path.home()])
+        findings = assess(drive, plan.space_needed, 0, protected=[env.app_dir, Path.home()])
         errs = [f.text for f in findings if f.level == "error"]
         if errs:
             raise AssembleError(" ".join(errs))
@@ -484,17 +502,20 @@ def run_copy(
         eta = ((total - done) / (done / el)) if done and el > 1 else None
         emit(OverallProgress(done, total, eta))
 
-    written = copy_to_usb(plan, st, usb, progress=prog, cancel=cancel)
+    result = copy_to_usb(plan, st, usb, progress=prog, cancel=cancel)
     bad: list[tuple[str, str]] = []
-    verified = 0
+    verified = len(result.skipped)  # hash-checked against the stick while deciding to skip them
     if verify:
         emit(StageChange("verify", "Reading the files back from the stick"))
 
         def vprog(done: int, total: int, rel: str) -> None:
             emit(OverallProgress(done, total, None))
 
-        rep = verify_usb(usb, written, progress=vprog, cancel=cancel)
-        bad, verified = rep.bad, rep.checked
-    report = CopyReport(usb, len(written), plan.bytes_needed, len(plan.replace), len(plan.stale), verified, bad, written)
+        rep = verify_usb(usb, result.written, progress=vprog, cancel=cancel)
+        bad, verified = rep.bad, verified + rep.checked
+    report = CopyReport(
+        usb, result.count, plan.bytes_total, len(plan.replace), len(result.removed), verified, bad,
+        {**result.skipped, **result.written}, len(result.skipped), len(result.left_alone),
+    )
     emit(Finished(report))
     return report

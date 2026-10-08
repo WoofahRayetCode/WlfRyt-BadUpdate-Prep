@@ -79,7 +79,8 @@ A checksum published next to a file proves it arrived intact, not that the proje
 ## Safety
 
 - It **never formats** a drive and only lists removable media by default. System drives (`/`, `/boot`, `/home`, your Windows system drive) and the app's own data folder are refused.
-- It only adds or replaces its own files. A hidden `.wlfryt-prep.json` on the stick records what it wrote, so a later run removes only *its own* leftovers - never your other files and never XeUnshackle's MAC-address backup in `BadUpdatePayload/`.
+- It only adds or replaces its own files. A hidden `.wlfryt-prep.json` on the stick records each file it wrote with its SHA-256. A later run removes a leftover only if it is still byte-for-byte what this app wrote, so never a file you edited and never XeUnshackle's MAC-address backup in `BadUpdatePayload/`. The marker is treated as untrusted: entries that point outside the stick are ignored.
+- Re-running is fast: files already identical on the stick are hash-checked and skipped. A file that did change needs room for a second copy while it is being replaced, and the app checks that first.
 - If you customised `launch.ini` (XeUnshackle's DashLaunch plugins) or `FreeMyXe.ini`, your copy is **kept**. If you chose a hotkey, your old `launch.ini` is saved as `launch.ini.bak-<date>` before the edited one is written; the exact change is shown as a diff.
 - Files are written to a temporary name, flushed, then renamed, so a pulled stick never leaves a half-written `default.xex`.
 

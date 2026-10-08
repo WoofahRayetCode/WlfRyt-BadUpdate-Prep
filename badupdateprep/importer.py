@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -127,17 +128,28 @@ def _extract_zip(src: Path, dst: Path) -> None:
                 shutil.copyfileobj(fin, fout)
 
 
-def _extract_7z(src: Path, dst: Path, run, which) -> None:
-    exe = find_7z(which)
-    if not exe:
-        raise ImportProblem(SEVENZ_HINT)
+def _run_7z(args: list[str], run) -> subprocess.CompletedProcess:
     kw = {}
     if sys.platform == "win32":
         kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW: no console flash from a windowed exe
     try:
-        proc = run([exe, "x", "-y", f"-o{dst}", "--", str(src)], capture_output=True, text=True, timeout=180, **kw)
+        return run(args, capture_output=True, text=True, timeout=180, **kw)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ImportProblem(f"Couldn't run 7-Zip: {exc}") from exc
+
+
+def _extract_7z(src: Path, dst: Path, run, which) -> None:
+    exe = find_7z(which)
+    if not exe:
+        raise ImportProblem(SEVENZ_HINT)
+    # Ask 7-Zip what the archive would expand to BEFORE extracting, so a hostile archive can't fill the disk.
+    listing = _run_7z([exe, "l", "-slt", "--", str(src)], run)
+    if listing.returncode != 0:
+        raise ImportProblem(f"7-Zip couldn't read {src.name}: {(listing.stderr or listing.stdout or '').strip()[:300]}")
+    total = sum(int(m.group(1)) for m in re.finditer(r"(?m)^Size = (\d+)\s*$", listing.stdout or ""))
+    if total > MAX_IMPORT_BYTES:
+        raise ImportProblem("That archive expands to much larger than XexMenu should; wrong file?")
+    proc = _run_7z([exe, "x", "-y", f"-o{dst}", "--", str(src)], run)
     if proc.returncode != 0:
         raise ImportProblem(f"7-Zip couldn't extract {src.name}: {(proc.stderr or proc.stdout or '').strip()[:300]}")
 

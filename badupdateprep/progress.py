@@ -12,6 +12,14 @@ class Cancelled(Exception):
     """Raised inside a worker when the user pressed Cancel."""
 
 
+def _run_closers(closers: list[Callable[[], None]]) -> None:
+    for fn in closers:
+        try:
+            fn()
+        except Exception:
+            pass
+
+
 class CancelToken:
     def __init__(self) -> None:
         self._ev = threading.Event()
@@ -27,14 +35,16 @@ class CancelToken:
             raise Cancelled()
 
     def cancel(self) -> None:
+        """Flag cancellation and tear down bound resources WITHOUT blocking the caller.
+
+        Closers run on a helper thread: closing an HTTP response waits for the reader's lock, which the download thread
+        holds while blocked in recv(). Doing that on the UI thread froze the window until the socket timed out.
+        """
         self._ev.set()
         with self._lock:
             closers, self._closers = self._closers, []
-        for fn in closers:
-            try:
-                fn()
-            except Exception:
-                pass
+        if closers:
+            threading.Thread(target=_run_closers, args=(closers,), name="cancel-closers", daemon=True).start()
 
     def bind(self, closer: Callable[[], None]) -> Callable[[], None]:
         """Register something to close on cancel (e.g. a live HTTP response). Returns an unbind callable."""

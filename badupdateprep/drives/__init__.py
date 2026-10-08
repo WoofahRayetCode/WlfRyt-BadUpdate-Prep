@@ -88,6 +88,22 @@ def is_windows_system_path(path: str, system_drive: str | None = None) -> bool:
     return bool(drive) and drive == sysd
 
 
+def _st_dev(path: str) -> int | None:
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
+
+
+def _on_root_device(path: str) -> bool:
+    """POSIX: the folder lives on the same filesystem as '/', i.e. it is not a separately mounted stick
+    (typically an empty mount point left behind after unmounting)."""
+    if sys.platform == "win32":
+        return False
+    here, root = _st_dev(path), _st_dev("/")
+    return here is not None and here == root
+
+
 def free_and_total(mount: str) -> tuple[int | None, int | None]:
     try:
         u = shutil.disk_usage(mount)
@@ -125,7 +141,7 @@ def describe_path(path: Path, drives: Iterable[Drive]) -> Drive:
                 best = d
     free, total = free_and_total(p)
     if best is None:
-        system = looks_like_system_mount(p) if sys.platform != "win32" else is_windows_system_path(p)
+        system = is_windows_system_path(p) if sys.platform == "win32" else (looks_like_system_mount(p) or _on_root_device(p))
         return Drive(p, Path(p).name or p, "", total, free, False, system=system)
     return replace(best, mount=p, free=free if free is not None else best.free)
 

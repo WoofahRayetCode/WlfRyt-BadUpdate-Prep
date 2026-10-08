@@ -183,7 +183,7 @@ class UsbPage(Page):
         p = filedialog.askdirectory(title="Folder on your USB stick (its root)")
         if not p:
             return
-        d = describe_path(Path(p), self._drives)
+        d = describe_path(Path(p), list_drives(include_fixed=True))  # all drives: a folder on an internal disk must be recognised as such
         from dataclasses import replace
 
         d = replace(d, device="folder", label=d.label or Path(p).name)
@@ -209,21 +209,28 @@ class UsbPage(Page):
         if not d:
             return
         plan = self._plan()
-        need, repl = (plan.bytes_needed, plan.bytes_replaced) if plan else self._need()
+        need, repl = (plan.space_needed, 0) if plan else self._need()
         for f in assess(d, need, repl, protected=self._protected()):
             ttk.Label(self.findings, text=f"{ICON[f.level]}  {f.text}", style=STYLE[f.level], wraplength=880, justify="left").pack(anchor="w")
         if plan:
-            bits = [f"{len(plan.write)} files ({fmt_bytes(plan.bytes_needed)}) will be written"]
-            if plan.replace:
-                bits.append(f"{len(plan.replace)} existing files replaced")
-            if plan.stale:
-                bits.append(f"{len(plan.stale)} old files from a previous run removed")
-            bits.append(f"{plan.preserved} other files left alone")
-            if plan.kept:
-                bits.append("your existing " + ", ".join(plan.kept) + " is kept as it is")
-            if plan.backups:
-                bits.append("your existing " + ", ".join(plan.backups) + " is backed up (.bak-date) before being replaced")
-            ttk.Label(self.findings, text="•  " + "; ".join(bits) + ".", style="CardMuted.TLabel", wraplength=880, justify="left").pack(anchor="w", pady=(4, 0))
+            ttk.Label(self.findings, text="\u2022  " + "; ".join(self._plan_bits(plan)) + ".", style="CardMuted.TLabel", wraplength=880, justify="left").pack(anchor="w", pady=(4, 0))
+
+    @staticmethod
+    def _plan_bits(plan) -> list[str]:
+        writing = len(plan.write) - len(plan.unchanged)
+        bits = [f"{writing} files ({fmt_bytes(plan.bytes_needed)}) will be written"] if writing else ["nothing new to write"]
+        if plan.unchanged:
+            bits.append(f"{len(plan.unchanged)} files already match and are skipped")
+        if plan.replace:
+            bits.append(f"{len(plan.replace)} existing files replaced")
+        if plan.stale:
+            bits.append(f"up to {len(plan.stale)} old files from a previous run removed (only if you haven't changed them)")
+        bits.append("everything else on the stick is left alone")
+        if plan.kept:
+            bits.append("your existing " + ", ".join(plan.kept) + " is kept as it is")
+        if plan.backups:
+            bits.append("your existing " + ", ".join(plan.backups) + " is backed up (.bak-date) before being replaced")
+        return bits
 
     def _update_buttons(self) -> None:
         running = self.copier.running
@@ -237,7 +244,7 @@ class UsbPage(Page):
 
     def _plan_numbers(self) -> tuple[int, int]:
         plan = self._plan()
-        return (plan.bytes_needed, plan.bytes_replaced) if plan else self._need()
+        return (plan.space_needed, 0) if plan else self._need()
 
     # -- copying ---------------------------------------------------------------------------------
     def _copy(self) -> None:
@@ -248,12 +255,9 @@ class UsbPage(Page):
         if plan is None:
             return
         msg = (
-            f"Write {len(plan.write)} files ({fmt_bytes(plan.bytes_needed)}) to:\n\n"
-            f"  {d.display}\n  {d.fs or 'unknown format'}, {fmt_bytes(d.size) if d.size else '?'} total, {fmt_bytes(d.free) if d.free is not None else '?'} free\n\n"
-            f"{len(plan.replace)} existing files will be replaced and {len(plan.stale)} old files from a previous run removed.\n"
-            f"{plan.preserved} other files on the stick are left alone. Nothing is formatted."
-            + (f"\n\nYour existing {', '.join(plan.kept)} is kept as it is." if plan.kept else "")
-            + (f"\n\nYour existing {', '.join(plan.backups)} is saved as a .bak copy first, because you chose a hotkey." if plan.backups else "")
+            f"Copy to:\n\n  {d.display}\n  {d.fs or 'unknown format'}, {fmt_bytes(d.size) if d.size else '?'} total, {fmt_bytes(d.free) if d.free is not None else '?'} free\n\n"
+            + "\n".join("\u2022 " + b[0].upper() + b[1:] + "." for b in self._plan_bits(plan))
+            + "\n\nNothing is formatted."
         )
         if not messagebox.askokcancel("Copy to USB", msg):
             return
@@ -312,7 +316,9 @@ class UsbPage(Page):
         self.pbar.configure(value=1000)
         self.stage.configure(text="Done")
         self.overall.configure(text="")
-        extra = f" {rep.stale_removed} old files removed." if rep.stale_removed else ""
+        extra = (f" {rep.unchanged} were already up to date." if rep.unchanged else "") + (f" {rep.stale_removed} old files removed." if rep.stale_removed else "")
+        if rep.left_alone:
+            extra += f" {rep.left_alone} old files were left alone because you had changed them."
         self.result.configure(
             text=f"✓ Copied {rep.copied} files ({fmt_bytes(rep.bytes)}) and read them all back successfully.{extra}\n\n"
                  f"Now eject the stick safely. {eject_hint()}",

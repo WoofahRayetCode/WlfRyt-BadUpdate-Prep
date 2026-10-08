@@ -5,8 +5,11 @@ Latest channel  -> one `GET /releases` per repo, ETag-cached, prerelease-aware, 
 """
 from __future__ import annotations
 
+import http.client
 import json
 import re
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -14,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .catalog import Artifact, Channel
-from .downloader import USER_AGENT, DownloadError, default_opener
+from .downloader import CERT_HELP, USER_AGENT, DownloadError, _is_cert_problem, default_opener
 
 API_BASE = "https://api.github.com"
 API_TIMEOUT = 20.0
@@ -55,6 +58,8 @@ class Resolved:
 
 # ---------------------------------------------------------------------------------------------------
 def parse_releases(payload: list[dict]) -> list[Release]:
+    if not isinstance(payload, list) or not all(isinstance(r, dict) for r in payload):
+        raise ValueError("GitHub's releases answer is not a list of releases")
     out: list[Release] = []
     for rel in payload:
         if rel.get("draft"):
@@ -143,18 +148,30 @@ def list_releases(
     req = urllib.request.Request(url, headers=_api_headers(token, cached.get("etag")))
     try:
         resp = opener(req, API_TIMEOUT)
+        with resp:
+            etag = resp.headers.get("ETag")
+            raw = resp.read()
+        body = json.loads(raw.decode("utf-8"))
+        releases = parse_releases(body)
     except urllib.error.HTTPError as exc:
         exc.close()
         if exc.code == 304 and cached.get("body") is not None:
-            return parse_releases(cached["body"])
+            try:
+                return parse_releases(cached["body"])
+            except (ValueError, TypeError, AttributeError, KeyError) as bad:
+                raise DownloadError("GitHub's cached answer is unreadable; try again.", kind="network", retryable=True) from bad
         if exc.code in (403, 429) and (exc.headers.get("X-RateLimit-Remaining") == "0" or exc.code == 429):
             raise _rate_limit_error(exc) from exc
         raise DownloadError(f"HTTP {exc.code} for {url}", kind="http", status=exc.code) from exc
-    except (urllib.error.URLError, OSError) as exc:
+    except (ValueError, TypeError, AttributeError, KeyError) as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        raise DownloadError(
+            "GitHub's answer couldn't be understood (a captive portal or proxy in the way?). Use 'Tested versions' to avoid it.",
+            kind="network", retryable=True,
+        ) from exc
+    except (urllib.error.URLError, OSError, http.client.HTTPException, socket.timeout, ssl.SSLError) as exc:
+        if _is_cert_problem(exc):
+            raise DownloadError(CERT_HELP, kind="network", retryable=False) from exc
         raise DownloadError(f"Network error for {url}: {getattr(exc, 'reason', exc)}", kind="network", retryable=True) from exc
-    with resp:
-        etag = resp.headers.get("ETag")
-        body = json.loads(resp.read().decode("utf-8"))
     if cache_file and etag:
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +180,7 @@ def list_releases(
             tmp.replace(cache_file)
         except OSError:
             pass
-    return parse_releases(body)
+    return releases
 
 
 # ---------------------------------------------------------------------------------------------------

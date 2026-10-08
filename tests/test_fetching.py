@@ -1,4 +1,5 @@
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -134,6 +135,22 @@ class Metadata(unittest.TestCase):
         self.assertEqual(seen, [None, '"abc"'])
         self.assertEqual(a[0].tag, b[0].tag)
 
+    def test_token_is_not_forwarded_across_a_cross_host_redirect(self):
+        # Reviewer finding: urllib copies Authorization onto the redirected request, so the README's "only ever sent to
+        # api.github.com" was false. Two local servers = two different netlocs.
+        with FaultyServer({"/elsewhere": b"[]"}) as other, FaultyServer({}) as api:
+            api.redirect_to["/repos/o/r/releases?per_page=15"] = other.url("/elsewhere")
+            list_releases("o", "r", api_base=api.base, token="SECRET-TOKEN")
+            self.assertEqual(len(other.requests), 1, "the redirect was followed")
+            self.assertEqual(api.requests[0]["headers"].get("authorization"), "Bearer SECRET-TOKEN", "the API itself gets it")
+            self.assertNotIn("authorization", other.requests[0]["headers"], "another host must never see the token")
+
+    def test_token_survives_a_same_host_redirect(self):
+        with FaultyServer({"/moved": b"[]"}) as api:
+            api.redirect_to["/repos/o/r/releases?per_page=15"] = api.url("/moved")
+            list_releases("o", "r", api_base=api.base, token="T")
+            self.assertEqual(api.requests[-1]["headers"].get("authorization"), "Bearer T")
+
     def test_token_only_goes_to_api(self):
         seen = {}
 
@@ -173,6 +190,78 @@ class Metadata(unittest.TestCase):
         r = resolve(catalog.BADUPDATE, Channel.LATEST, opener=lambda req, t: FakeResp(body))
         self.assertEqual((r.tag, r.provenance), ("v9", "github-digest"))
         self.assertEqual(r.hashes, (("sha256", "c" * 64),))
+
+
+class RawFailuresBecomeDownloadErrors(unittest.TestCase):
+    """Reviewer finding: only URLError/OSError were caught, so a captive portal, truncated body or odd JSON escaped as a raw
+    exception - skipping the offline fallback and the 'switch to tested versions' button."""
+
+    class Raises(FakeResp):
+        def __init__(self, exc):
+            super().__init__(b"")
+            self._exc = exc
+
+        def read(self, n=-1):
+            raise self._exc
+
+    CASES = {
+        "captive portal html": lambda req, t: FakeResp(b"<html><body>Please sign in to the wifi</body></html>"),
+        "json dict not list": lambda req, t: FakeResp(b'{"message": "Bad credentials", "documentation_url": "x"}'),
+        "list of strings": lambda req, t: FakeResp(b'["a", "b"]'),
+        "invalid utf-8": lambda req, t: FakeResp(b"\xff\xfe\x00"),
+        "incomplete read": lambda req, t: RawFailuresBecomeDownloadErrors.Raises(http.client.IncompleteRead(b"x")),
+        "mid-body timeout": lambda req, t: RawFailuresBecomeDownloadErrors.Raises(TimeoutError("timed out")),
+        "connection reset mid-body": lambda req, t: RawFailuresBecomeDownloadErrors.Raises(ConnectionResetError()),
+    }
+
+    def test_every_failure_is_a_download_error(self):
+        for name, opener in self.CASES.items():
+            with self.subTest(name):
+                with self.assertRaises(DownloadError):
+                    list_releases("o", "r", opener=opener)
+
+    def test_bad_status_line_from_opener(self):
+        def opener(req, t):
+            raise http.client.BadStatusLine("")
+
+        with self.assertRaises(DownloadError):
+            list_releases("o", "r", opener=opener)
+
+    def test_latest_channel_falls_back_to_cache_on_each_failure(self):
+        for name, opener in self.CASES.items():
+            with self.subTest(name), TemporaryDirectory() as td:
+                data = DATA
+                cache = DownloadCache(Path(td) / "downloads")
+                art = catalog.BADUPDATE
+                r0 = Resolved(art, "v1", "p.zip", "u", len(data), (("sha256", hashlib.sha256(data).hexdigest()),), "pinned")
+                p = cache.path_for_resolved(r0)
+                p.parent.mkdir(parents=True)
+                p.write_bytes(data)
+                cache.record(r0, p, hashlib.sha256(data).hexdigest())
+                env = Env(app_dir=Path(td), channel=Channel.LATEST, opener=opener)
+                logs = []
+                from badupdateprep.pipeline import resolve_artifact
+
+                got = resolve_artifact(art, env, logs.append)
+                self.assertTrue(got.offline and got.tag == "v1")
+
+    def test_fallback_message_matches_the_cause(self):
+        from badupdateprep.pipeline import resolve_artifact
+
+        with TemporaryDirectory() as td:
+            cache = DownloadCache(Path(td) / "downloads")
+            art = catalog.BADUPDATE
+            r0 = Resolved(art, "v1", "p.zip", "u", len(DATA), (("sha256", SHA),), "pinned")
+            p = cache.path_for_resolved(r0)
+            p.parent.mkdir(parents=True)
+            p.write_bytes(DATA)
+            cache.record(r0, p, SHA)
+            body = json.dumps([release("v9", [("something-else.zip", None)])]).encode()  # layout drift: no matching asset
+            logs = []
+            resolve_artifact(art, Env(app_dir=Path(td), channel=Channel.LATEST, opener=lambda req, t: FakeResp(body)), logs.append)
+            text = " ".join(getattr(e, "text", "") for e in logs)
+            self.assertIn("layout", text.lower())
+            self.assertNotIn("no connection", text.lower(), "layout drift must not be reported as a network problem")
 
 
 class Cache(unittest.TestCase):
@@ -306,6 +395,7 @@ class Ensure(unittest.TestCase):
             logs = []
             got = ensure_artifact(art, offline, logs.append)
             self.assertTrue(got.cached and got.offline)
+            self.assertEqual(got.resolved.provenance, "cached", "a fallback copy was NOT checked against a pin, so it must not claim to be")
             self.assertTrue(any("cached" in getattr(e, "text", "") for e in logs))
 
     def test_offline_with_empty_cache_raises(self):

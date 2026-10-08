@@ -18,6 +18,7 @@ import socket
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,8 +64,27 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
+class _StripCredentialsOnCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib copies every header (including Authorization) onto the redirected request; never hand credentials to another host.
+    Range / If-Range are deliberately kept so resuming works across GitHub's redirect to its CDN."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc.lower() != urllib.parse.urlsplit(req.full_url).netloc.lower():
+            for name in list(new.headers):
+                if name.lower() in ("authorization", "cookie"):
+                    del new.headers[name]
+            for name in list(new.unredirected_hdrs):
+                if name.lower() in ("authorization", "cookie"):
+                    del new.unredirected_hdrs[name]
+        return new
+
+
 def default_opener(req: urllib.request.Request, timeout: float):
-    return urllib.request.urlopen(req, context=_ssl_context(), timeout=timeout)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=_ssl_context()), _StripCredentialsOnCrossHostRedirect()
+    )
+    return opener.open(req, timeout=timeout)
 
 
 def _hasher(name: str):
@@ -156,6 +176,41 @@ def _classify_http(exc: urllib.error.HTTPError, url: str) -> DownloadError:
     return err
 
 
+def _read_some(resp) -> bytes:
+    """read1 returns whatever has arrived (at most one underlying recv), so a trickling server never makes us wait for a full chunk."""
+    read1 = getattr(resp, "read1", None)
+    return read1(CHUNK) if read1 else resp.read(CHUNK)
+
+
+CERT_HELP = (
+    "Couldn't verify the server's security certificate, so the download was refused. Check your computer's date and time; "
+    "on macOS with python.org Python run 'Install Certificates.command'; and if you're on a work or school network, a proxy may "
+    "be intercepting HTTPS."
+)
+
+
+def _is_cert_problem(exc: BaseException) -> bool:
+    return isinstance(getattr(exc, "reason", exc), ssl.SSLCertVerificationError)
+
+
+def _hard_close(resp) -> None:
+    """Close a response even while another thread is blocked reading it.
+
+    shutdown() on the underlying socket wakes the blocked recv() immediately; a plain close() would wait for the
+    reader's lock (i.e. for the socket timeout). Falls back gracefully for objects that aren't real http responses.
+    """
+    try:
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        resp.close()
+    except Exception:
+        pass
+
+
 def _sidecar(part: Path) -> Path:
     return part.with_name(part.name + ".json")
 
@@ -236,10 +291,12 @@ def _attempt(
             raise DownloadError("Server rejected resume range; restarting", kind="http", status=416, retryable=True) from exc
         raise _classify_http(exc, spec.url) from exc
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException) as exc:
+        if _is_cert_problem(exc):
+            raise DownloadError(CERT_HELP, kind="network", retryable=False) from exc  # retrying can never fix this
         reason = getattr(exc, "reason", exc)
         raise DownloadError(f"Network error for {spec.url}: {reason}", kind="network", retryable=True) from exc
 
-    unbind = cancel.bind(resp.close) if cancel else (lambda: None)
+    unbind = cancel.bind(lambda: _hard_close(resp)) if cancel else (lambda: None)
     try:
         status = getattr(resp, "status", None) or resp.getcode()
         rh = resp.headers
@@ -282,11 +339,15 @@ def _attempt(
                     if cancel:
                         cancel.check()
                     try:
-                        chunk = resp.read(CHUNK)
-                    except (socket.timeout, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException, OSError) as exc:
+                        chunk = _read_some(resp)
+                    except Exception as exc:  # noqa: BLE001
                         if cancel and cancel.cancelled:
+                            # cancel() tore the connection down under us; http.client then fails in assorted ways
+                            # (AttributeError on its closed file, ValueError, OSError...). All of them mean "cancelled".
                             cancel.check()
-                        raise DownloadError(f"Connection lost: {exc}", kind="network", retryable=True) from exc
+                        if isinstance(exc, (socket.timeout, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException, OSError)):
+                            raise DownloadError(f"Connection lost: {exc}", kind="network", retryable=True) from exc
+                        raise
                     if not chunk:
                         break
                     f.write(chunk)
@@ -302,6 +363,8 @@ def _attempt(
             if cancel and cancel.cancelled:
                 cancel.check()
             raise DownloadError(f"Disk write failed: {exc}", kind="disk") from exc
+        if cancel:
+            cancel.check()  # a cancel() that shut the socket down looks like a clean EOF here
         if total is not None and got < total:
             raise DownloadError(f"Connection closed early ({got}/{total} bytes)", kind="network", retryable=True)
         if progress:

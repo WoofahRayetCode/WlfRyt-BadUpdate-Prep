@@ -301,4 +301,9 @@ class ChoosePage(Page):
 
     def on_show(self) -> None:
         self.state.imported = imported_extras(self.state.env)
+        # Other pages change options too (e.g. "Switch to tested versions"); re-read them so the next edit here
+        # can't silently write the stale widget values back.
+        self._loading = True
+        self._push_options_to_vars(self.state.options)
+        self._loading = False
         self._refresh()

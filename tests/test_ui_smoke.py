@@ -113,8 +113,12 @@ class WizardSmoke(Base):
         page.tree.selection_set("0")
         pump(app, seconds=0.05)
         self.assertNotIn("disabled", page.btn_copy.state())
-        with mock.patch("badupdateprep.ui.pages.usb.messagebox.askokcancel", return_value=True):
+        with mock.patch("badupdateprep.ui.pages.usb.messagebox.askokcancel", return_value=True) as ask:
             page.btn_copy.invoke()
+        shown = ask.call_args[0][1]
+        self.assertIn("will be written", shown)
+        self.assertIn("left alone", shown)
+        self.assertIn("Nothing is formatted", shown)
         self.assertTrue(pump(app, until=lambda: app.model.copy_report is not None), "copy should finish")
         self.assertTrue(app.model.copy_report.ok)
         self.assertEqual((usb / "BadUpdatePayload" / "default.xex").read_bytes(), b"XEUNSHACKLE")
@@ -125,6 +129,27 @@ class WizardSmoke(Base):
         self.assertEqual(app.current_step, 4)
         self.assertEqual(app.next_btn.cget("text"), "Close")
         self.assertGreaterEqual(len(app.pages[4].scroll.inner.winfo_children()), 8)
+
+    def test_switching_to_tested_versions_is_reflected_on_the_choose_page(self):
+        # Reviewer finding: "Switch to tested versions and retry" changed the option but not the Choose radio, so the next
+        # unrelated edit silently flipped the channel back to Latest and saved it.
+        from badupdateprep.catalog import Channel
+
+        app = self.app
+        app.pages[0].ack.set(True)
+        app.next_btn.invoke()
+        ch = app.pages[1]
+        ch.mode.set("custom")
+        ch._mode_changed()
+        ch.v_channel.set("latest")
+        ch._changed()
+        self.assertEqual(app.model.options.channel, Channel.LATEST)
+        app.model.options.channel = Channel.PINNED  # what PreparePage._use_pinned does
+        app.goto(1, force=True)
+        self.assertEqual(ch.v_channel.get(), "pinned", "Choose must re-read the options when it is shown again")
+        ch.v_nand.set(True)
+        ch._changed()
+        self.assertEqual(app.model.options.channel, Channel.PINNED, "an unrelated edit must not flip the channel back")
 
     def _describe(self, path: Path):
         from badupdateprep.drives import describe_path

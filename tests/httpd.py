@@ -27,6 +27,9 @@ class FaultyServer:
         self.etag = '"v1"'
         self.always_status: int | None = None
         self.chunk_delay = 0.0
+        self.stall_after: int | None = None  # send this many body bytes, then hang until `release` is set
+        self.stalled = threading.Event()
+        self.release = threading.Event()
         self.requests: list[dict] = []
         outer = self
 
@@ -91,6 +94,12 @@ class FaultyServer:
                     self.close_connection = True
                     self.connection.close()
                     return
+                if outer.stall_after is not None:
+                    self.wfile.write(chunk[: outer.stall_after])
+                    self.wfile.flush()
+                    outer.stalled.set()
+                    outer.release.wait(30)
+                    return
                 if outer.chunk_delay:
                     import time
 
@@ -112,6 +121,7 @@ class FaultyServer:
         return self
 
     def __exit__(self, *exc) -> None:
+        self.release.set()  # never leave a handler thread hanging on shutdown
         self._httpd.shutdown()
         self._httpd.server_close()
 

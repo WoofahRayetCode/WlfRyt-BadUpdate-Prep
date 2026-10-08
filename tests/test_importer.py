@@ -90,6 +90,8 @@ class Import(unittest.TestCase):
 
             def fake_run(cmd, **kw):
                 calls.append((cmd, kw))
+                if cmd[1] == "l":
+                    return subprocess.CompletedProcess(cmd, 0, "Path = XeXMenu/default.xex\nSize = 12345\n", "")
                 out = Path([a for a in cmd if a.startswith("-o")][0][2:])
                 (out / "XeXMenu").mkdir()
                 (out / "XeXMenu" / "default.xex").write_bytes(b"X")
@@ -97,17 +99,49 @@ class Import(unittest.TestCase):
 
             imp = import_extra("xexmenu", p, app_dir=td / "app", run=fake_run, which=lambda n: "/usr/bin/7z" if n == "7z" else None)
             self.assertEqual(imp.entry_xex, "default.xex")
-            cmd, kw = calls[0]
-            self.assertIsInstance(cmd, list)
-            self.assertNotIn("shell", kw)
-            self.assertEqual(cmd[-2:], ["--", str(p)])
+            self.assertEqual([c[0][1] for c in calls], ["l", "x"], "list first, extract second")
+            for cmd, kw in calls:
+                self.assertIsInstance(cmd, list)
+                self.assertNotIn("shell", kw)
+                self.assertEqual(cmd[-2:], ["--", str(p)])
+
+    def test_7z_that_would_expand_beyond_the_cap_is_refused_before_extracting(self):
+        # Reviewer finding: MAX_IMPORT_BYTES was enforced for zip and folder imports but not 7z, so only the 180 s timeout
+        # bounded how much a hostile archive could expand into the app dir.
+        with TemporaryDirectory() as td:
+            td = Path(td)
+            p = td / "bomb.7z"
+            p.write_bytes(b"fake")
+            calls = []
+
+            def fake_run(cmd, **kw):
+                calls.append(cmd[1])
+                return subprocess.CompletedProcess(cmd, 0, "Path = a\nSize = 400000000\nPath = b\nSize = 400000000\n", "")
+
+            with self.assertRaises(ImportProblem) as cm:
+                import_extra("xexmenu", p, app_dir=td / "app", run=fake_run, which=lambda n: "/usr/bin/7z")
+            self.assertIn("much larger", str(cm.exception))
+            self.assertEqual(calls, ["l"], "must refuse before extracting anything")
+            self.assertFalse((td / "app" / "xexmenu").exists())
+
+    def test_7z_listing_failure_is_reported(self):
+        with TemporaryDirectory() as td:
+            td = Path(td)
+            p = td / "x.7z"
+            p.write_bytes(b"x")
+            run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 2, "", "Can not open file as archive")
+            with self.assertRaises(ImportProblem) as cm:
+                import_extra("xexmenu", p, app_dir=td / "app", run=run, which=lambda n: "/x/7z")
+            self.assertIn("Can not open", str(cm.exception))
 
     def test_7z_failure_surfaces_stderr(self):
         with TemporaryDirectory() as td:
             td = Path(td)
             p = td / "x.7z"
             p.write_bytes(b"x")
-            run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 2, "", "Headers Error")
+            run = lambda cmd, **kw: (
+                subprocess.CompletedProcess(cmd, 0, "Size = 10\n", "") if cmd[1] == "l" else subprocess.CompletedProcess(cmd, 2, "", "Headers Error")
+            )
             with self.assertRaises(ImportProblem) as cm:
                 import_extra("xexmenu", p, app_dir=td / "app", run=run, which=lambda n: "/x/7z")
             self.assertIn("Headers Error", str(cm.exception))

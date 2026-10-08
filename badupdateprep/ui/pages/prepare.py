@@ -29,8 +29,11 @@ STATUS_TEXT = {
     "cached": "Ready (cached)", "ready": "Ready", "failed": "Failed", "skipped": "Skipped",
 }
 # What we will check against (before the file is verified) and what we did check (after). A tick means verified.
-CHECK_EXPECTED = {"pinned": "SHA-256 pinned", "github-digest": "GitHub digest", "unverified": "no checksum", "imported": "imported by you"}
-CHECK_VERIFIED = {"pinned": "\u2713 SHA-256 verified", "github-digest": "\u2713 digest verified", "unverified": "\u26a0 unverified", "imported": "imported by you"}
+CHECK_EXPECTED = {"pinned": "SHA-256 pinned", "github-digest": "GitHub digest", "unverified": "no checksum", "cached": "cached copy", "imported": "imported by you"}
+CHECK_VERIFIED = {
+    "pinned": "\u2713 SHA-256 verified", "github-digest": "\u2713 digest verified", "unverified": "\u26a0 unverified",
+    "cached": "\u2713 cached copy intact", "imported": "imported by you",
+}
 
 
 def check_text(provenance: str, done: bool) -> str:

@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from badupdateprep import catalog
 from badupdateprep.assemble import load_staging, staging_is_current
 from badupdateprep.catalog import Channel, Pin
-from badupdateprep.downloader import RetryPolicy
+from badupdateprep.downloader import DownloadError, RetryPolicy
 from badupdateprep.drives import Drive
 from badupdateprep.importer import import_extra
 from badupdateprep.options import AutoLaunch, Options
@@ -175,6 +175,25 @@ class PrepareE2E(Base):
         logs = []
         res = run_prepare(Options(payload="stock", rbb_trial=False, channel=Channel.LATEST), off, logs.append)
         self.assertTrue(res.staging.path.exists())
+
+
+class ErrorTitles(unittest.TestCase):
+    def test_titles_are_added_to_every_kind_of_failure(self):
+        # Reviewer finding: OSError.__str__ ignores args, so mutating args left PermissionError without the item name.
+        from badupdateprep.errors import AssembleError
+        from badupdateprep.pipeline import _with_title
+
+        cases = [PermissionError(13, "Permission denied", "/x/y"), OSError("disk exploded"), UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"),
+                 DownloadError("HTTP 503", kind="http", status=503), AssembleError("layout changed"), RuntimeError("boom")]
+        for exc in cases:
+            with self.subTest(type(exc).__name__):
+                out = _with_title(exc, "XeUnshackle")
+                self.assertTrue(str(out).startswith("XeUnshackle: "), str(out))
+        d = DownloadError("HTTP 503", kind="http", status=503, retryable=True)
+        out = _with_title(d, "XeUnshackle")
+        self.assertIs(out, d, "our own errors keep their identity (kind/status/retryable)")
+        self.assertEqual((out.kind, out.status, out.retryable), ("http", 503, True))
+        self.assertEqual(str(_with_title(_with_title(d, "XeUnshackle"), "XeUnshackle")).count("XeUnshackle"), 1, "no double prefix")
 
 
 class CopyE2E(Base):

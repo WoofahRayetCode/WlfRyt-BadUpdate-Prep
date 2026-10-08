@@ -1,9 +1,11 @@
 import json
 import plistlib
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from badupdateprep.drives import Drive, assess, describe_path, has_errors, is_windows_system_path, looks_like_system_mount, normalize_fs
 from badupdateprep.drives import linux, macos, windows
@@ -206,6 +208,22 @@ class Assess(unittest.TestCase):
         self.assertFalse(is_windows_system_path("E:\\", "C:"))
         self.assertFalse(is_windows_system_path("/run/media/x", "C:"))
         self.assertTrue(is_windows_system_path("D:\\stuff", "D:"), "the system drive isn't always C:")
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX device ids")
+    def test_unmounted_mountpoint_on_the_root_filesystem_is_a_system_path(self):
+        # Reviewer finding: with no matching drive, Browse accepted ANY non-system-looking folder with just a warning,
+        # e.g. an empty /mnt/usb left behind after the stick was unmounted - which would fill the system disk.
+        with TemporaryDirectory() as td, mock.patch("badupdateprep.drives._st_dev", return_value=42):
+            d = describe_path(Path(td), [])
+            self.assertTrue(d.system, "same device as / means it is not a separate stick")
+            self.assertTrue(has_errors(assess(d, 1)))
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX device ids")
+    def test_folder_on_its_own_device_is_not_flagged_as_system(self):
+        stick = Path("/run/media/eric/STICK/xbox")  # a realistic automount path on its own device
+        with mock.patch("badupdateprep.drives._st_dev", side_effect=lambda p: 1 if p == "/" else 2):
+            d = describe_path(stick, [])
+            self.assertFalse(d.system)
 
     def test_describe_path_uses_containing_drive(self):
         with TemporaryDirectory() as td:

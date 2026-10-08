@@ -1,7 +1,10 @@
 import hashlib
 import os
+import ssl
 import threading
+import time
 import unittest
+import urllib.error
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -144,6 +147,50 @@ class Fetch(unittest.TestCase):
             fetch(s, **NOSLEEP)
             self.assertEqual(s.dest.read_bytes(), DATA)
             self.assertTrue(any(r["headers"].get("range") for r in srv.requests))
+
+    def test_cancel_interrupts_a_stalled_connection_quickly(self):
+        # Reviewer finding: cancel() ran resp.close() on the caller (UI) thread, which blocks on the reader's lock until the
+        # stalled read times out (20 s in the app). Both the cancel call and the unwinding of the download must be near-instant.
+        with FaultyServer({"/f.zip": DATA}) as srv, TemporaryDirectory() as td:
+            srv.stall_after = 1000
+            token = CancelToken()
+            out: dict = {}
+
+            def run():
+                try:
+                    fetch(spec(srv, td), cancel=token, timeout=20, **NOSLEEP)
+                except BaseException as exc:  # noqa: BLE001
+                    out["exc"] = exc
+                out["done"] = time.monotonic()
+
+            t = threading.Thread(target=run)
+            t.start()
+            self.assertTrue(srv.stalled.wait(5), "server should be mid-body")
+            time.sleep(0.2)
+            t0 = time.monotonic()
+            token.cancel()
+            cancel_took = time.monotonic() - t0
+            t.join(8)
+            self.assertFalse(t.is_alive(), "download thread must unwind promptly, not wait for the 20 s socket timeout")
+            self.assertLess(cancel_took, 0.5, "cancel() must not block the caller")
+            self.assertLess(out["done"] - t0, 3.0)
+            self.assertIsInstance(out["exc"], Cancelled)
+
+    def test_certificate_failure_is_not_retried_and_explains_itself(self):
+        # Reviewer finding: SSLCertVerificationError was treated as retryable, so a Mac without root certificates burned ~15 s
+        # of backoff before failing with a cryptic message.
+        calls = []
+
+        def opener(req, timeout):
+            calls.append(1)
+            raise urllib.error.URLError(ssl.SSLCertVerificationError(1, "certificate verify failed: unable to get local issuer certificate"))
+
+        with FaultyServer({"/f.zip": DATA}) as srv, TemporaryDirectory() as td:
+            with self.assertRaises(DownloadError) as cm:
+                fetch(spec(srv, td), opener=opener, retry=RetryPolicy(attempts=5, base=0), sleep=lambda s: None)
+        self.assertEqual(len(calls), 1, "retrying can never fix a certificate problem")
+        self.assertFalse(cm.exception.retryable)
+        self.assertIn("certificate", str(cm.exception).lower())
 
     def test_gives_up_after_attempts(self):
         with FaultyServer({"/f.zip": DATA}) as srv, TemporaryDirectory() as td:

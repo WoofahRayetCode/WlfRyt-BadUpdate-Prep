@@ -37,6 +37,10 @@ class StagingInfo:
     files: tuple[tuple[str, int], ...]  # (usb-relative path, size)
     total_bytes: int
     edited: tuple[str, ...] = ()  # staged files this app modified on purpose (e.g. launch.ini hotkey)
+    hashes: tuple[tuple[str, str], ...] = ()  # (usb-relative path, sha256) - lets re-copies skip unchanged files
+
+    def hash_map(self) -> dict[str, str]:
+        return dict(self.hashes)
 
 
 def fingerprint(
@@ -87,6 +91,7 @@ def build_staging(
         transforms["launch.ini"] = lambda data: IniDoc.parse(data).apply(list(ini_edits)).to_bytes()
     try:
         files: list[tuple[str, int]] = []
+        digests: dict[str, str] = {}
         for e in plan.entries:
             if cancel:
                 cancel.check()
@@ -94,11 +99,13 @@ def build_staging(
             out.parent.mkdir(parents=True, exist_ok=True)
             src = sources[e.src_key]
             written = 0
+            h = hashlib.sha256()
             tf = transforms.get(e.dest.lower())
             with src.open(e.member) as fin:
                 if tf:
                     data = tf(fin.read())
                     out.write_bytes(data)
+                    h.update(data)
                     written = len(data)
                     done += e.size
                 else:
@@ -110,6 +117,7 @@ def build_staging(
                             if not chunk:
                                 break
                             fout.write(chunk)
+                            h.update(chunk)
                             written += len(chunk)
                             done += len(chunk)
                             if progress:
@@ -117,6 +125,7 @@ def build_staging(
                     if written != e.size:
                         raise AssembleError(f"{e.dest}: wrote {written} bytes but the archive says {e.size}.")
             files.append((e.dest, written))
+            digests[e.dest] = h.hexdigest()
             if progress:
                 progress(done, total, e.dest)
         info_files = tuple(sorted(files))
@@ -126,6 +135,7 @@ def build_staging(
             "files": info_files,
             "total_bytes": sum(s for _, s in info_files),
             "edited": sorted(e.dest for e in plan.entries if e.dest.lower() in transforms),
+            "hashes": digests,
             "warnings": plan.warnings,
         }
         (build / MANIFEST).write_text(json.dumps(manifest, indent=1), "utf-8")
@@ -142,7 +152,7 @@ def build_staging(
     else:
         os.replace(build, current)
     edited = tuple(sorted(e.dest for e in plan.entries if e.dest.lower() in transforms))
-    return StagingInfo(current, fingerprint_value, info_files, sum(s for _, s in info_files), edited)
+    return StagingInfo(current, fingerprint_value, info_files, sum(s for _, s in info_files), edited, tuple(sorted(digests.items())))
 
 
 def load_staging(staging_root: Path) -> StagingInfo | None:
@@ -150,7 +160,8 @@ def load_staging(staging_root: Path) -> StagingInfo | None:
     try:
         m = json.loads((cur / MANIFEST).read_text("utf-8"))
         files = tuple((str(p), int(s)) for p, s in m["files"])
-        return StagingInfo(cur, m["fingerprint"], files, int(m["total_bytes"]), tuple(m.get("edited", ())))
+        hashes = tuple(sorted((str(k), str(v)) for k, v in (m.get("hashes") or {}).items()))
+        return StagingInfo(cur, m["fingerprint"], files, int(m["total_bytes"]), tuple(m.get("edited", ())), hashes)
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
