@@ -1,78 +1,99 @@
 # WlfRyt BadUpdate Prep
 
-Desktop helper for [grimdoomer/Xbox360BadUpdate](https://github.com/grimdoomer/Xbox360BadUpdate). It downloads the current Retail USB pack, a post-exploit payload, and (optionally) the Rock Band Blitz arcade trial, then stages a FAT32 USB tree you can copy in one shot.
-
-The last wizard step is a **local copy** of the official How To Use wiki (LEDs, errors, Blitz troubleshooting, boot-anim recovery, FAQ). No browser required.
+A desktop wizard that prepares a USB stick for [grimdoomer/Xbox360BadUpdate](https://github.com/grimdoomer/Xbox360BadUpdate). It downloads the right files, **verifies them**, builds the correct folder layout, copies it to your FAT32 stick, **reads it back to check**, and ends with an on-console checklist. The full Bad Update wiki (LED patterns, error codes, Blitz troubleshooting, boot-animation recovery, FAQ) is bundled for offline use.
 
 Bad Update is a **non-persistent** hypervisor exploit for dashboard **2.0.17559.0**. Power off and you start over. It is **not** a replacement for RGH.
 
 **Not affiliated** with grimdoomer, XeUnshackle, FreeMyXe, Internet Archive, or Microsoft.
 
+## The five steps
+
+1. **Welcome** - the three things that matter (17559, stay off Xbox Live, it's temporary).
+2. **Choose** - *Recommended* (Rock Band Blitz pack + arcade trial + XeUnshackle, tested versions) or *Custom* (ABadAvatar, FreeMyXe, NAND dump tool, XexMenu, a hotkey to start a tool).
+3. **Prepare** - downloads with per-file status, speed and ETA; resumes interrupted transfers; verifies SHA-256; builds the stick layout. Cancel any time.
+4. **USB** - detects your stick (name, format, size, free space), warns about anything unsafe, copies with progress, then re-reads every file from the stick.
+5. **Console** - a checklist of what to do on the Xbox 360.
+
+The **Guide** button (or F1) opens the offline wiki at any time.
+
 ## Requirements
 
-- Windows, Python 3.10+ (Tkinter included with the official installer)
-- Xbox 360 on **2.0.17559.0**
-- FAT32 USB (512 MB+ if you include the Blitz trial; format >32 GB sticks on the 360 dashboard or with Rufus / GUIformat)
+- Python 3.10+ **with Tk 8.6**
+  - Windows: the python.org installer includes it.
+  - Linux: `python3-tk` (Debian/Ubuntu), `tk` (Arch: `sudo pacman -S tk`), `python3-tkinter` (Fedora).
+  - macOS: python.org's installer, or `brew install python-tk`. (Apple's system Python ships Tk 8.5, which is too old.)
+- An Xbox 360 on **2.0.17559.0**
+- A FAT32 USB stick, 512 MB or larger if you include the Blitz trial (about 410 MB used) (format sticks over 32 GB on the 360 dashboard or with Rufus / GUIformat)
+- Optional: 7-Zip, only to import XexMenu's `.7z`
 
-This app **never formats** the drive.
+No pip packages are needed at runtime.
 
 ## Run from source
 
-```powershell
-cd C:\Users\ericp\OneDrive\Documents\GitHub\WlfRyt-BadUpdate-Prep
-python app.py
+```sh
+python app.py            # or: python -m badupdateprep
 ```
 
-or:
+## Build a portable Windows .exe
 
 ```powershell
-python -m badupdateprep
-```
-
-No extra pip packages.
-
-## Build a portable .exe
-
-```powershell
-.\build.ps1
-```
-
-Or double-click `build.bat`. Output: `dist\WlfRyt-BadUpdate-Prep.exe`
-
-Each build stamps `APP_VERSION` as `yyyy.MMdd.HHmm` in the window title, then restores source to `dev`.
-
-```powershell
+.\build.ps1              # or double-click build.bat
 .\build.ps1 -Clean       # wipe build/ and dist/ first
-.\build.ps1 -SkipTests   # skip unit tests
+.\build.ps1 -SkipTests
 ```
+
+Output: `dist\WlfRyt-BadUpdate-Prep.exe`. Each build stamps `APP_VERSION` as `yyyy.MMdd.HHmm`, then restores the source to `dev`.
 
 ## Tests
 
-```powershell
-python -m unittest discover -s tests -v
+```sh
+python -m unittest discover -s tests -t . -v
 ```
 
-## What it downloads
+Everything except the UI runs headless. To also check the pinned checksums and install layouts against the real upstream files, put the pinned release files in a folder (under their release asset names) and run:
 
-| Item | Source | USB placement |
+```sh
+WLFRYT_REAL_ZIPS=/path/to/folder python -m unittest tests.test_real_zips -v
+```
+
+## What it puts on the stick
+
+| Item | Source | Where it goes |
 | --- | --- | --- |
-| Xbox360BadUpdate Retail USB | GitHub latest `*USB*.zip` | `BadUpdatePayload/`, `Content/`, `name.txt` from the **Rock Band Blitz** folder (v1.3 dropped Tony Hawk) |
-| XeUnshackle (default) | `Byrom90/XeUnshackle` | `BadUpdatePayload/default.xex` plus `launch.ini` / DashLaunch extras |
-| FreeMyXe (optional) | `FreeMyXe/FreeMyXe` | `BadUpdatePayload/default.xex` |
-| ABadAvatar (optional entry) | `shutterbug2000/ABadAvatar` if a release exists | USB root |
-| Simple 360 NAND Flasher read-only | `alex-free/XDK_Projects` | `Applications/` — dump only; writing NAND on BadUpdate can brick |
-| Rock Band Blitz arcade trial | [Internet Archive rbblitz-trial](https://archive.org/details/rbblitz-trial) (delisted free XBLA) | `Content/0000000000000000/5841122D/` so Games can launch it with no disc |
+| Xbox360BadUpdate Retail USB | GitHub `grimdoomer/Xbox360BadUpdate` | `BadUpdatePayload/`, `Content/...` (the **Rock Band Blitz** folder of the pack) |
+| XeUnshackle (default payload) | GitHub `Byrom90/XeUnshackle` | `BadUpdatePayload/default.xex` (+ `BadStorage.xex.dll`); `launch.ini`, `Xbdm.xex`, `JRPC2.xex` in the root |
+| FreeMyXe (optional payload) | GitHub `FreeMyXe/FreeMyXe` | **everything** in `BadUpdatePayload/` (`FreeMyXe.xex` becomes `default.xex`; `FreeMyXe.ini`, `xell-2f.bin`, `BadStorage.dll` beside it), as its own docs say |
+| ABadAvatar (optional entry, **beta**) | GitHub `shutterbug2000/ABadAvatar` | `BadUpdatePayload/`, `Content/...` in the root; needs a payload |
+| Simple 360 NAND Flasher, read-only (optional) | GitHub `alex-free/XDK_Projects` | `Apps/Simple360NANDFlasher/` - dump only; writing NAND on Bad Update can brick |
+| Rock Band Blitz arcade trial | [Internet Archive](https://archive.org/details/rbblitz-trial) (delisted free XBLA demo) | `Content/0000000000000000/5841122D/000D0000/` so Games can launch it without a disc |
+| XexMenu 1.2 (optional) | **you** download it (the host blocks scripted downloads) and use *Import* | `Apps/XexMenu/` |
 
-Stock `default.xex` can be kept for **boot animation recovery** (hold Y + A on Rock Band Blitz “Press A To Start”).
+Keeping the stock `default.xex` is only for **boot-animation recovery** (hold Y + A on Rock Band Blitz "Press A To Start").
 
-Cached downloads live under `%USERPROFILE%\.wlfrit-badupdate\`.
+### Tested versus latest
+
+*Tested versions* (the default) are the exact releases this app's layouts were checked against, each verified by a SHA-256 pinned in the source, with no GitHub API calls (so no rate limit, and it works offline once cached). *Latest from GitHub* fetches the newest releases; the zip layout is checked before anything is written, and if upstream changed it you get a clear message and a one-click switch back to tested versions instead of a broken stick. Anonymous GitHub API use is limited to 60 requests/hour; set a `GITHUB_TOKEN` environment variable to raise it (it is only ever sent to `api.github.com`).
+
+A checksum published next to a file proves it arrived intact, not that the project is trustworthy; only the pins in `badupdateprep/catalog.py` are an independent anchor.
+
+## Safety
+
+- It **never formats** a drive and only lists removable media by default. System drives (`/`, `/boot`, `/home`, your Windows system drive) and the app's own data folder are refused.
+- It only adds or replaces its own files. A hidden `.wlfryt-prep.json` on the stick records each file it wrote with its SHA-256. A later run removes a leftover only if it is still byte-for-byte what this app wrote, so never a file you edited and never XeUnshackle's MAC-address backup in `BadUpdatePayload/`. The marker is treated as untrusted: entries that point outside the stick are ignored.
+- Re-running is fast: files already identical on the stick are hash-checked and skipped. A file that did change needs room for a second copy while it is being replaced, and the app checks that first.
+- If you customised `launch.ini` (XeUnshackle's DashLaunch plugins) or `FreeMyXe.ini`, your copy is **kept**. If you chose a hotkey, your old `launch.ini` is saved as `launch.ini.bak-<date>` before the edited one is written; the exact change is shown as a diff.
+- Files are written to a temporary name, flushed, then renamed, so a pulled stick never leaves a half-written `default.xex`.
+
+## Where files live
+
+Downloads, staging and settings are under `~/.wlfrit-badupdate` if that folder already exists, otherwise `%LOCALAPPDATA%\WlfRyt-BadUpdate-Prep` (Windows), `~/Library/Application Support/WlfRyt-BadUpdate-Prep` (macOS) or `~/.cache/wlfryt-badupdate-prep` (Linux). Set `WLFRYT_HOME` to use another folder. Deleting it is always safe; it only costs a re-download.
 
 ## On the console
 
 1. System Info must show **17559**.
 2. Unplug Ethernet and forget Wi-Fi. Running this on Xbox Live can ban the console.
-3. Plug in the USB. My Xbox → Games → Rock Band Blitz → press A (or ABadAvatar on profile select — do not sign into the exploit profile).
-4. Full green ring of light = unsigned `default.xex` is running.
-5. Power-off drops the hack. Dump NAND read-only if you included the flasher; never write NAND on Bad Update.
+3. Plug in **only** this USB. My Xbox > Games > Rock Band Blitz > press A (or ABadAvatar on profile select - don't sign into the exploit profile).
+4. A full green ring of light = your unsigned `default.xex` is running.
+5. Keep the USB plugged in (DashLaunch needs it). Power-off drops the hack. Dump NAND read-only if you included the flasher; never write NAND on Bad Update.
 
-Details are in the in-app **Guide** tab, adapted from [the official wiki](https://github.com/grimdoomer/Xbox360BadUpdate/wiki/How-To-Use).
+Details are in the in-app **Guide**, adapted from [the official wiki](https://github.com/grimdoomer/Xbox360BadUpdate/wiki/How-To-Use).

@@ -1,87 +1,230 @@
+"""Release metadata: which file do we download, from where, and what checksum do we expect?
+
+Pinned channel  -> derived straight from the catalog `Pin`; makes no API call (no rate limit, works offline).
+Latest channel  -> one `GET /releases` per repo, ETag-cached, prerelease-aware, strict asset matching.
+"""
 from __future__ import annotations
 
+import http.client
 import json
+import re
+import socket
 import ssl
+import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
-from .catalog import PICKERS, Artifact
+from .catalog import Artifact, Channel
+from .downloader import CERT_HELP, USER_AGENT, DownloadError, _is_cert_problem, default_opener
 
-USER_AGENT = "WlfRyt-BadUpdate-Prep (homebrew USB helper)"
-TIMEOUT = 600
-
-
-class DownloadError(RuntimeError):
-    pass
+API_BASE = "https://api.github.com"
+API_TIMEOUT = 20.0
 
 
-def _ctx() -> ssl.SSLContext:
-    return ssl.create_default_context()
+class RateLimited(DownloadError):
+    def __init__(self, message: str, reset_epoch: int | None = None):
+        super().__init__(message, kind="rate_limit", status=403, retryable=False)
+        self.reset_epoch = reset_epoch
 
 
-def http_get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
+@dataclass(frozen=True)
+class ReleaseAsset:
+    name: str
+    url: str
+    size: int
+    sha256: str | None  # from GitHub's `digest: "sha256:<hex>"`
+
+
+@dataclass(frozen=True)
+class Release:
+    tag: str
+    prerelease: bool
+    assets: tuple[ReleaseAsset, ...]
+
+
+@dataclass(frozen=True)
+class Resolved:
+    art: Artifact
+    tag: str
+    asset: str
+    url: str
+    size: int | None
+    hashes: tuple[tuple[str, str], ...]
+    provenance: str  # "pinned" | "github-digest" | "unverified"
+    offline: bool = False
+
+
+# ---------------------------------------------------------------------------------------------------
+def parse_releases(payload: list[dict]) -> list[Release]:
+    if not isinstance(payload, list) or not all(isinstance(r, dict) for r in payload):
+        raise ValueError("GitHub's releases answer is not a list of releases")
+    out: list[Release] = []
+    for rel in payload:
+        if rel.get("draft"):
+            continue
+        assets = []
+        for a in rel.get("assets") or []:
+            digest = a.get("digest") or ""
+            sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else None
+            assets.append(
+                ReleaseAsset(
+                    name=a.get("name") or "",
+                    url=a.get("browser_download_url") or "",
+                    size=int(a.get("size") or 0),
+                    sha256=sha,
+                )
+            )
+        out.append(Release(tag=rel.get("tag_name") or rel.get("name") or "?", prerelease=bool(rel.get("prerelease")), assets=tuple(assets)))
+    return out
+
+
+def pick_release(rels: list[Release], allow_prerelease: bool) -> Release:
+    for r in rels:
+        if allow_prerelease or not r.prerelease:
+            return r
+    raise DownloadError("No suitable GitHub release found.", kind="http")
+
+
+def pick_asset(rel: Release, pattern: str) -> ReleaseAsset:
+    rx = re.compile(pattern)
+    hits = [a for a in rel.assets if rx.search(a.name)]
+    names = [a.name for a in rel.assets]
+    if not hits:
+        raise DownloadError(
+            f"Release {rel.tag} has no asset matching {pattern!r}. Assets: {names}. Use 'Tested versions'.", kind="layout"
+        )
+    if len(hits) > 1:
+        raise DownloadError(
+            f"Release {rel.tag} has several assets matching {pattern!r}: {[a.name for a in hits]}. Use 'Tested versions'.",
+            kind="layout",
+        )
+    return hits[0]
+
+
+def _rate_limit_error(exc: urllib.error.HTTPError) -> RateLimited:
+    reset = exc.headers.get("X-RateLimit-Reset") if exc.headers else None
+    reset_epoch = int(reset) if reset and reset.isdigit() else None
+    when = ""
+    if reset_epoch:
+        mins = max(1, int((reset_epoch - time.time()) / 60) + 1)
+        when = f" It resets in about {mins} min."
+    return RateLimited(
+        "GitHub's anonymous API limit (60 requests/hour) is used up." + when
+        + " Switch to 'Tested versions' (no API calls), or set a GITHUB_TOKEN environment variable.",
+        reset_epoch,
+    )
+
+
+def _api_headers(token: str | None, etag: str | None) -> dict[str, str]:
+    h = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    if etag:
+        h["If-None-Match"] = etag
+    return h
+
+
+def list_releases(
+    owner: str,
+    repo: str,
+    *,
+    cache_dir: Path | None = None,
+    api_base: str = API_BASE,
+    token: str | None = None,
+    opener=None,
+) -> list[Release]:
+    """GET /releases?per_page=15 with ETag caching (a 304 does not count against the rate limit)."""
+    opener = opener or default_opener
+    cache_file = (cache_dir / f"{owner}_{repo}.json") if cache_dir else None
+    cached: dict = {}
+    if cache_file and cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text("utf-8"))
+        except (OSError, ValueError):
+            cached = {}
+    url = f"{api_base}/repos/{owner}/{repo}/releases?per_page=15"
+    req = urllib.request.Request(url, headers=_api_headers(token, cached.get("etag")))
     try:
-        with urllib.request.urlopen(req, context=_ctx(), timeout=TIMEOUT) as resp:
-            return resp.read()
+        resp = opener(req, API_TIMEOUT)
+        with resp:
+            etag = resp.headers.get("ETag")
+            raw = resp.read()
+        body = json.loads(raw.decode("utf-8"))
+        releases = parse_releases(body)
     except urllib.error.HTTPError as exc:
-        raise DownloadError(f"HTTP {exc.code} for {url}") from exc
-    except urllib.error.URLError as exc:
-        raise DownloadError(f"Network error for {url}: {exc.reason}") from exc
+        exc.close()
+        if exc.code == 304 and cached.get("body") is not None:
+            try:
+                return parse_releases(cached["body"])
+            except (ValueError, TypeError, AttributeError, KeyError) as bad:
+                raise DownloadError("GitHub's cached answer is unreadable; try again.", kind="network", retryable=True) from bad
+        if exc.code in (403, 429) and (exc.headers.get("X-RateLimit-Remaining") == "0" or exc.code == 429):
+            raise _rate_limit_error(exc) from exc
+        raise DownloadError(f"HTTP {exc.code} for {url}", kind="http", status=exc.code) from exc
+    except (ValueError, TypeError, AttributeError, KeyError) as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        raise DownloadError(
+            "GitHub's answer couldn't be understood (a captive portal or proxy in the way?). Use 'Tested versions' to avoid it.",
+            kind="network", retryable=True,
+        ) from exc
+    except (urllib.error.URLError, OSError, http.client.HTTPException, socket.timeout, ssl.SSLError) as exc:
+        if _is_cert_problem(exc):
+            raise DownloadError(CERT_HELP, kind="network", retryable=False) from exc
+        raise DownloadError(f"Network error for {url}: {getattr(exc, 'reason', exc)}", kind="network", retryable=True) from exc
+    if cache_file and etag:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"etag": etag, "body": body}), "utf-8")
+            tmp.replace(cache_file)
+        except OSError:
+            pass
+    return releases
 
 
-def latest_release(owner: str, repo: str) -> dict:
-    url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
-    try:
-        return json.loads(http_get(url).decode("utf-8"))
-    except DownloadError as exc:
-        if "404" not in str(exc):
-            raise
-        listing = json.loads(http_get(f"https://api.github.com/repos/{owner}/{repo}/releases").decode("utf-8"))
-        if not listing:
-            raise DownloadError(f"No GitHub releases for {owner}/{repo}")
-        return listing[0]
+# ---------------------------------------------------------------------------------------------------
+def pin_url(art: Artifact) -> str:
+    pin = art.pin
+    assert pin is not None
+    return pin.url or f"https://github.com/{art.owner}/{art.repo}/releases/download/{pin.tag}/{pin.asset}"
 
 
-def resolve_artifact(art: Artifact) -> tuple[str, str]:
-    if art.source == "url":
-        if not art.url:
-            raise DownloadError(f"No URL for {art.title}")
-        return art.url, "direct"
-    rel = latest_release(art.owner, art.repo)
-    tag = rel.get("tag_name") or rel.get("name") or "latest"
-    picker = PICKERS[art.pick]
-    url = picker(rel.get("assets") or [])
-    if not url:
-        names = [a.get("name") for a in rel.get("assets") or []]
-        raise DownloadError(f"No zip asset for {art.title} ({tag}). Assets: {names}")
-    return url, tag
+def resolve_pinned(art: Artifact) -> Resolved:
+    pin = art.pin
+    if pin is None:
+        raise DownloadError(f"{art.title} has no tested version pinned.", kind="layout")
+    hashes = (("sha256", pin.sha256),) + pin.extra_hashes
+    return Resolved(art, pin.tag, pin.asset, pin_url(art), pin.size, hashes, "pinned")
 
 
-def filename_from_url(url: str, fallback: str) -> str:
-    name = url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
-    return name or fallback
+def resolve_latest(
+    art: Artifact,
+    *,
+    meta_dir: Path | None = None,
+    api_base: str = API_BASE,
+    token: str | None = None,
+    opener=None,
+) -> Resolved:
+    rels = list_releases(art.owner, art.repo, cache_dir=meta_dir, api_base=api_base, token=token, opener=opener)
+    rel = pick_release(rels, art.allow_prerelease)
+    asset = pick_asset(rel, art.asset_re)
+    hashes = (("sha256", asset.sha256),) if asset.sha256 else ()
+    return Resolved(art, rel.tag, asset.name, asset.url, asset.size or None, hashes, "github-digest" if asset.sha256 else "unverified")
 
 
-def download_to(url: str, dest: Path, progress=None) -> Path:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, context=_ctx(), timeout=TIMEOUT) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            got = 0
-            with dest.open("wb") as f:
-                while True:
-                    chunk = resp.read(256 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    got += len(chunk)
-                    if progress:
-                        progress(got, total)
-    except urllib.error.HTTPError as exc:
-        raise DownloadError(f"HTTP {exc.code} downloading {url}") from exc
-    except urllib.error.URLError as exc:
-        raise DownloadError(f"Network error downloading {url}: {exc.reason}") from exc
-    return dest
+def resolve(
+    art: Artifact,
+    channel: Channel,
+    *,
+    meta_dir: Path | None = None,
+    api_base: str = API_BASE,
+    token: str | None = None,
+    opener=None,
+) -> Resolved:
+    """Decide exactly which file to fetch. Items hosted outside GitHub always use their pin."""
+    if art.source == "manual":
+        raise DownloadError(f"{art.title} is imported manually, not downloaded.", kind="layout")
+    if art.source == "url" or channel == Channel.PINNED:
+        return resolve_pinned(art)
+    return resolve_latest(art, meta_dir=meta_dir, api_base=api_base, token=token, opener=opener)
